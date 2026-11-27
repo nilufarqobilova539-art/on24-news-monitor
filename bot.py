@@ -2,14 +2,21 @@
 import os
 import re
 import html
+import json
+import base64
 import urllib.request
 import urllib.parse
+import urllib.error
 import xml.etree.ElementTree as ET
+
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
+
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")
 
 FEEDS = {
     "Kun.uz": "https://kun.uz/news/rss",
@@ -22,6 +29,26 @@ FEEDS = {
     "UzNet Press UZ": "https://uznet.press/rss/today_uz.xml",
     "UzNet Press RU": "https://uznet.press/rss/today_ru.xml",
 }
+
+STATE_FILE = "sent_items.json"
+LOCAL_TZ = timezone(timedelta(hours=5))
+
+IMPORTANT_WORDS = [
+    "halok", "vafot", "o'ldir", "öldir", "qotillik",
+    "zo'ravon", "zöravon", "portlash", "yong'in",
+    "avariya", "falokat", "qidiruv", "hibsga",
+    "firibgarlik", "sud", "jazo", "hodisa",
+    "favqulodda", "taqiqlan", "cheklov",
+    "narx osh", "qimmatlash", "dollar",
+    "qaror", "qonun", "iste'fo", "tayinlandi",
+    "protest", "namoyish", "urush", "hujum",
+    "skandal", "shov-shuv", "breaking", "urgent",
+    "смерть", "погиб", "убийств", "насили",
+    "взрыв", "пожар", "авари", "задержан",
+    "арест", "мошеннич", "суд", "запрет",
+    "ограничен", "повышен цен", "скандал",
+    "срочно", "чп", "назначен", "отставка",
+]
 
 def clean(text):
     text = re.sub(r"<[^>]+>", " ", text or "")
@@ -49,6 +76,110 @@ def parse_date(value):
 
     return date.astimezone(timezone.utc)
 
+def score_news(title, summary):
+    text = (title + " " + summary).lower()
+    score = 0
+
+    for word in IMPORTANT_WORDS:
+        if word in text:
+            score += 3
+
+    if any(word in text for word in [
+        "rasmiy", "official", "официально",
+        "vazir", "prezident", "hokim",
+        "minister", "министр"
+    ]):
+        score += 1
+
+    return score
+
+def get_link(entry):
+    link = get_value(entry, "link")
+
+    if link.startswith("http"):
+        return link
+
+    for child in entry:
+        if child.tag.split("}")[-1].lower() == "link":
+            href = child.attrib.get("href", "")
+            if href.startswith("http"):
+                return href
+
+    return ""
+
+def load_sent_items():
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+        print("GitHub xotirasi ulanmagan.")
+        return set(), None
+
+    url = (
+        f"https://api.github.com/repos/"
+        f"{GITHUB_REPOSITORY}/contents/{STATE_FILE}"
+    )
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "ON24-News-Monitor"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode())
+
+        content = base64.b64decode(data["content"]).decode()
+        items = json.loads(content)
+        return set(items), data["sha"]
+
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return set(), None
+        raise
+
+def save_sent_items(items, sha):
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+        print("Takrorlarni doimiy saqlash uchun GITHUB_TOKEN kerak.")
+        return
+
+    url = (
+        f"https://api.github.com/repos/"
+        f"{GITHUB_REPOSITORY}/contents/{STATE_FILE}"
+    )
+
+    content = json.dumps(
+        sorted(items)[-1000:],
+        ensure_ascii=False,
+        indent=2
+    )
+
+    payload = {
+        "message": "Update sent news history",
+        "content": base64.b64encode(
+            content.encode()
+        ).decode()
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "ON24-News-Monitor",
+            "Content-Type": "application/json"
+        },
+        method="PUT"
+    )
+
+    with urllib.request.urlopen(request, timeout=20) as response:
+        print("Yuborilgan xabarlar tarixi saqlandi.")
+
 def send(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
@@ -66,6 +197,8 @@ def send(text):
 def main():
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=35)
+
+    sent_items, state_sha = load_sent_items()
     news = []
 
     for source, feed_url in FEEDS.items():
@@ -80,19 +213,19 @@ def main():
 
             entries = [
                 element for element in root.iter()
-                if element.tag.split("}")[-1].lower() in ("item", "entry")
+                if element.tag.split("}")[-1].lower()
+                in ("item", "entry")
             ]
 
             for entry in entries:
                 title = clean(get_value(entry, "title"))
-                link = get_value(entry, "link")
+                link = get_link(entry)
 
-                if not link.startswith("http"):
-                    for child in entry:
-                        if child.tag.split("}")[-1].lower() == "link":
-                            link = child.attrib.get("href", "")
-                            if link:
-                                break
+                summary = clean(
+                    get_value(entry, "description")
+                    or get_value(entry, "summary")
+                    or get_value(entry, "encoded")
+                )
 
                 date_text = (
                     get_value(entry, "pubDate")
@@ -102,40 +235,71 @@ def main():
 
                 published = parse_date(date_text)
 
-                if (
-                    title and link.startswith("http")
-                    and published
-                    and cutoff <= published <= now + timedelta(minutes=5)
-                ):
-                    news.append((published, source, title, link))
+                if not title or not link or not published:
+                    continue
+
+                if not (cutoff <= published <= now + timedelta(minutes=5)):
+                    continue
+
+                item_id = link.split("?")[0].rstrip("/")
+
+                if item_id in sent_items:
+                    continue
+
+                score = score_news(title, summary)
+
+                news.append({
+                    "date": published,
+                    "source": source,
+                    "title": title,
+                    "summary": summary,
+                    "link": link,
+                    "id": item_id,
+                    "score": score
+                })
 
             print(f"{source}: tekshirildi")
 
         except Exception as error:
             print(f"{source}: xatolik - {error}")
 
-    news.sort(reverse=True)
+    news.sort(
+        key=lambda item: (item["score"], item["date"]),
+        reverse=True
+    )
 
     if not news:
         print("Yangi xabar topilmadi.")
         return
 
-    for published, source, title, link in news[:15]:
-        local_time = published.astimezone(
-            timezone(timedelta(hours=5))
+    sent_count = 0
+
+    for item in news[:10]:
+        local_time = item["date"].astimezone(
+            LOCAL_TZ
         ).strftime("%H:%M")
 
+        summary = item["summary"][:450]
+
         message = (
-            f"📰 {title}\n\n"
-            f"Manba: {source}\n"
-            f"E'lon qilingan vaqt: {local_time}\n"
-            f"🔗 {link}\n\n"
-            f"⚠️ Tahririyat tekshiruvidan o'tkazilsin."
+            f"📰 {item['title']}\n\n"
+            f"{summary}\n\n"
+            f"Manba: {item['source']}\n"
+            f"E'lon vaqti: {local_time}\n"
+            f"🔗 {item['link']}\n\n"
+            f"⚠️ Nashrdan oldin tekshiring."
         )
 
         send(message)
+        sent_items.add(item["id"])
+        sent_count += 1
 
-    print(f"Yuborilgan xabarlar: {min(len(news), 15)}")
+    save_sent_items(sent_items, state_sha)
+
+    print(f"Yuborilgan xabarlar: {sent_count}")
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
