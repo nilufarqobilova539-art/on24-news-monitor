@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
@@ -47,6 +48,7 @@ IMPORTANT_WORDS = [
     "срочно", "чп", "назначен", "отставка",
 ]
 
+
 def github_request(path, payload=None):
     url = (
         f"https://api.github.com/repos/"
@@ -75,15 +77,18 @@ def github_request(path, payload=None):
     with urllib.request.urlopen(request, timeout=20) as response:
         return json.loads(response.read().decode())
 
+
 def read_state(filename):
     try:
         data = github_request(filename)
         content = base64.b64decode(data["content"]).decode()
         return json.loads(content), data["sha"]
+
     except urllib.error.HTTPError as error:
         if error.code == 404:
             return {}, None
         raise
+
 
 def write_state(filename, state, sha, message):
     content = json.dumps(
@@ -104,6 +109,7 @@ def write_state(filename, state, sha, message):
 
     github_request(filename, payload)
 
+
 def should_run():
     now = datetime.now(LOCAL_TZ)
 
@@ -113,13 +119,19 @@ def should_run():
 
     state, sha = read_state("schedule_state.json")
 
+    if not isinstance(state, dict):
+        state = {}
+
     last_run_text = state.get("last_run")
 
     if last_run_text:
         last_run = datetime.fromisoformat(last_run_text)
 
         if now - last_run < timedelta(minutes=25):
-            print("25 daqiqa hali o'tmadi. Keyingi tekshiruv kutiladi.")
+            print(
+                "25 daqiqa hali o'tmadi. "
+                "Keyingi tekshiruv kutiladi."
+            )
             return False
 
     state["last_run"] = now.isoformat()
@@ -134,17 +146,20 @@ def should_run():
     print("Yangiliklarni tekshirish boshlandi.")
     return True
 
+
 def clean(text):
     text = re.sub(r"<[^>]+>", " ", text or "")
     return html.unescape(
         re.sub(r"\s+", " ", text)
     ).strip()
 
+
 def get_value(element, name):
     for child in element:
         if child.tag.split("}")[-1].lower() == name.lower():
             return child.text or child.attrib.get("href", "")
     return ""
+
 
 def get_link(entry):
     link = get_value(entry, "link")
@@ -159,6 +174,7 @@ def get_link(entry):
                 return href
 
     return ""
+
 
 def parse_date(value):
     if not value:
@@ -179,6 +195,7 @@ def parse_date(value):
 
     return date.astimezone(timezone.utc)
 
+
 def score_news(title, summary):
     text = (title + " " + summary).lower()
     score = 0
@@ -188,6 +205,7 @@ def score_news(title, summary):
             score += 3
 
     return score
+
 
 def send(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -203,6 +221,7 @@ def send(text):
     with urllib.request.urlopen(request, timeout=20) as response:
         print(response.read().decode())
 
+
 def main():
     if not should_run():
         return
@@ -211,7 +230,14 @@ def main():
     cutoff = now - timedelta(minutes=35)
 
     sent_state, sent_sha = read_state("sent_items.json")
-    sent_items = set(sent_state.get("items", []))
+
+    # Eski fayl list, yangi format esa dict bo'lishi mumkin.
+    if isinstance(sent_state, list):
+        sent_items = set(sent_state)
+    elif isinstance(sent_state, dict):
+        sent_items = set(sent_state.get("items", []))
+    else:
+        sent_items = set()
 
     news = []
 
@@ -219,10 +245,15 @@ def main():
         try:
             request = urllib.request.Request(
                 feed_url,
-                headers={"User-Agent": "ON24NewsMonitor/1.0"}
+                headers={
+                    "User-Agent": "ON24NewsMonitor/1.0"
+                }
             )
 
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(
+                request,
+                timeout=20
+            ) as response:
                 root = ET.fromstring(response.read())
 
             entries = [
@@ -251,7 +282,10 @@ def main():
                 if not title or not link or not published:
                     continue
 
-                if not (cutoff <= published <= now + timedelta(minutes=5)):
+                if not (
+                    cutoff <= published
+                    <= now + timedelta(minutes=5)
+                ):
                     continue
 
                 item_id = link.split("?")[0].rstrip("/")
@@ -283,6 +317,8 @@ def main():
         print("Yangi xabar topilmadi.")
         return
 
+    sent_count = 0
+
     for item in news[:10]:
         local_time = item["date"].astimezone(
             LOCAL_TZ
@@ -301,6 +337,7 @@ def main():
 
         send(message)
         sent_items.add(item["id"])
+        sent_count += 1
 
     write_state(
         "sent_items.json",
@@ -309,7 +346,8 @@ def main():
         "Update sent news history"
     )
 
-    print(f"Yuborilgan xabarlar: {min(len(news), 10)}")
+    print(f"Yuborilgan xabarlar: {sent_count}")
+
 
 if __name__ == "__main__":
     main()
