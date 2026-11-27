@@ -20,6 +20,7 @@ GITHUB_REPOSITORY = os.environ["GITHUB_REPOSITORY"]
 
 LOCAL_TZ = timezone(timedelta(hours=5))
 
+# OAV va yangiliklar saytlari
 FEEDS = {
     "Kun.uz": "https://kun.uz/news/rss",
     "Gazeta.uz": "https://www.gazeta.uz/ru/rss/",
@@ -30,6 +31,12 @@ FEEDS = {
     "Spot.uz": "https://www.spot.uz/ru/rss/",
     "UzNet Press UZ": "https://uznet.press/rss/today_uz.xml",
     "UzNet Press RU": "https://uznet.press/rss/today_ru.xml",
+}
+
+# Ochiq Telegram kanallari
+TELEGRAM_FEEDS = {
+    "Telegram @uzedu": "https://rsshub.app/telegram/channel/uzedu",
+    "Telegram @huquqiyaxborot": "https://rsshub.app/telegram/channel/huquqiyaxborot",
 }
 
 IMPORTANT_WORDS = [
@@ -117,32 +124,6 @@ def should_run():
         print("Hozir belgilangan ish vaqti emas.")
         return False
 
-    state, sha = read_state("schedule_state.json")
-
-    if not isinstance(state, dict):
-        state = {}
-
-    last_run_text = state.get("last_run")
-
-    if last_run_text:
-        last_run = datetime.fromisoformat(last_run_text)
-
-        if now - last_run < timedelta(minutes=25):
-            print(
-                "25 daqiqa hali o'tmadi. "
-                "Keyingi tekshiruv kutiladi."
-            )
-            return False
-
-    state["last_run"] = now.isoformat()
-
-    write_state(
-        "schedule_state.json",
-        state,
-        sha,
-        "Update ON24 schedule"
-    )
-
     print("Yangiliklarni tekshirish boshlandi.")
     return True
 
@@ -222,16 +203,87 @@ def send(text):
         print(response.read().decode())
 
 
+def check_feed(source, feed_url, news, sent_items, cutoff, now):
+    try:
+        request = urllib.request.Request(
+            feed_url,
+            headers={
+                "User-Agent": "ON24NewsMonitor/1.0"
+            }
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=30
+        ) as response:
+            root = ET.fromstring(response.read())
+
+        entries = [
+            element for element in root.iter()
+            if element.tag.split("}")[-1].lower()
+            in ("item", "entry")
+        ]
+
+        for entry in entries:
+            title = clean(get_value(entry, "title"))
+            link = get_link(entry)
+
+            summary = clean(
+                get_value(entry, "description")
+                or get_value(entry, "summary")
+                or get_value(entry, "content")
+            )
+
+            date_text = (
+                get_value(entry, "pubDate")
+                or get_value(entry, "published")
+                or get_value(entry, "updated")
+            )
+
+            published = parse_date(date_text)
+
+            if not title or not link or not published:
+                continue
+
+            if not (
+                cutoff <= published
+                <= now + timedelta(minutes=5)
+            ):
+                continue
+
+            item_id = link.split("?")[0].rstrip("/")
+
+            if item_id in sent_items:
+                continue
+
+            news.append({
+                "date": published,
+                "source": source,
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "id": item_id,
+                "score": score_news(title, summary),
+            })
+
+        print(f"{source}: tekshirildi")
+
+    except Exception as error:
+        print(f"{source}: xatolik - {error}")
+
+
 def main():
     if not should_run():
         return
 
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(minutes=35)
+
+    # Oxirgi 2 soat ichidagi yangiliklarni qidiradi.
+    # Bu GitHub tekshiruvi kechiksa ham xabarlarni o'tkazib yubormaslikka yordam beradi.
+    cutoff = now - timedelta(hours=2)
 
     sent_state, sent_sha = read_state("sent_items.json")
 
-    # Eski fayl list, yangi format esa dict bo'lishi mumkin.
     if isinstance(sent_state, list):
         sent_items = set(sent_state)
     elif isinstance(sent_state, dict):
@@ -241,72 +293,19 @@ def main():
 
     news = []
 
+    # Saytlar RSS manbalari
     for source, feed_url in FEEDS.items():
-        try:
-            request = urllib.request.Request(
-                feed_url,
-                headers={
-                    "User-Agent": "ON24NewsMonitor/1.0"
-                }
-            )
+        check_feed(
+            source, feed_url, news,
+            sent_items, cutoff, now
+        )
 
-            with urllib.request.urlopen(
-                request,
-                timeout=20
-            ) as response:
-                root = ET.fromstring(response.read())
-
-            entries = [
-                element for element in root.iter()
-                if element.tag.split("}")[-1].lower()
-                in ("item", "entry")
-            ]
-
-            for entry in entries:
-                title = clean(get_value(entry, "title"))
-                link = get_link(entry)
-
-                summary = clean(
-                    get_value(entry, "description")
-                    or get_value(entry, "summary")
-                )
-
-                date_text = (
-                    get_value(entry, "pubDate")
-                    or get_value(entry, "published")
-                    or get_value(entry, "updated")
-                )
-
-                published = parse_date(date_text)
-
-                if not title or not link or not published:
-                    continue
-
-                if not (
-                    cutoff <= published
-                    <= now + timedelta(minutes=5)
-                ):
-                    continue
-
-                item_id = link.split("?")[0].rstrip("/")
-
-                if item_id in sent_items:
-                    continue
-
-                news.append({
-                    "date": published,
-                    "source": source,
-                    "title": title,
-                    "summary": summary,
-                    "link": link,
-                    "id": item_id,
-                    "score": score_news(title, summary),
-                })
-
-            print(f"{source}: tekshirildi")
-
-        except Exception as error:
-            print(f"{source}: xatolik - {error}")
+    # Telegram kanallari RSS manbalari
+    for source, feed_url in TELEGRAM_FEEDS.items():
+        check_feed(
+            source, feed_url, news,
+            sent_items, cutoff, now
+        )
 
     news.sort(
         key=lambda item: (item["score"], item["date"]),
@@ -319,7 +318,7 @@ def main():
 
     sent_count = 0
 
-    for item in news[:10]:
+    for item in news[:30]:
         local_time = item["date"].astimezone(
             LOCAL_TZ
         ).strftime("%H:%M")
@@ -335,13 +334,17 @@ def main():
             f"⚠️ Nashrdan oldin tekshiring."
         )
 
-        send(message)
-        sent_items.add(item["id"])
-        sent_count += 1
+        try:
+            send(message)
+            sent_items.add(item["id"])
+            sent_count += 1
+
+        except Exception as error:
+            print(f"Xabar yuborilmadi: {error}")
 
     write_state(
         "sent_items.json",
-        {"items": sorted(sent_items)[-1000:]},
+        {"items": sorted(sent_items)[-3000:]},
         sent_sha,
         "Update sent news history"
     )
