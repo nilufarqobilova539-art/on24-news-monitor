@@ -1,14 +1,20 @@
 import os
-import requests
+import urllib.parse
+import urllib.request
+import json
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
 
-def send_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={
-        "chat_id": CHAT_ID,
-        "text": text
-    })
+url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-send_message("ON24 News Monitor ishga tushdi! ✅")
+data = urllib.parse.urlencode({
+    "chat_id": CHAT_ID,
+    "text": "ON24 News Monitor ishga tushdi! ✅"
+}).encode()
+
+request = urllib.request.Request(url, data=data)
+
+with urllib.request.urlopen(request) as response:
+    result = json.loads(response.read().decode())
+    print(result)
