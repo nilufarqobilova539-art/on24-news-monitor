@@ -1,21 +1,36 @@
-name: ON24 Bot Test
+
+name: ON24 News Monitor
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/5 3-17 * * *"
 
 permissions:
   contents: write
 
+concurrency:
+  group: on24-news-monitor
+  cancel-in-progress: false
+
 jobs:
-  test:
+  monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
       - name: Get code
         uses: actions/checkout@v4
 
-      - name: Run bot
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run news monitor
         run: python bot.py
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
