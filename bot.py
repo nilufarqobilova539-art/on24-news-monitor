@@ -14,9 +14,10 @@ from email.utils import parsedate_to_datetime
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_REPOSITORY = os.environ["GITHUB_REPOSITORY"]
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")
+LOCAL_TZ = timezone(timedelta(hours=5))
 
 FEEDS = {
     "Kun.uz": "https://kun.uz/news/rss",
@@ -30,9 +31,6 @@ FEEDS = {
     "UzNet Press RU": "https://uznet.press/rss/today_ru.xml",
 }
 
-STATE_FILE = "sent_items.json"
-LOCAL_TZ = timezone(timedelta(hours=5))
-
 IMPORTANT_WORDS = [
     "halok", "vafot", "o'ldir", "öldir", "qotillik",
     "zo'ravon", "zöravon", "portlash", "yong'in",
@@ -41,8 +39,7 @@ IMPORTANT_WORDS = [
     "favqulodda", "taqiqlan", "cheklov",
     "narx osh", "qimmatlash", "dollar",
     "qaror", "qonun", "iste'fo", "tayinlandi",
-    "protest", "namoyish", "urush", "hujum",
-    "skandal", "shov-shuv", "breaking", "urgent",
+    "namoyish", "urush", "hujum", "skandal",
     "смерть", "погиб", "убийств", "насили",
     "взрыв", "пожар", "авари", "задержан",
     "арест", "мошеннич", "суд", "запрет",
@@ -50,9 +47,98 @@ IMPORTANT_WORDS = [
     "срочно", "чп", "назначен", "отставка",
 ]
 
+def github_request(path, payload=None):
+    url = (
+        f"https://api.github.com/repos/"
+        f"{GITHUB_REPOSITORY}/contents/{path}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "ON24-News-Monitor",
+    }
+
+    if payload is None:
+        request = urllib.request.Request(url, headers=headers)
+    else:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                **headers,
+                "Content-Type": "application/json",
+            },
+            method="PUT",
+        )
+
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode())
+
+def read_state(filename):
+    try:
+        data = github_request(filename)
+        content = base64.b64decode(data["content"]).decode()
+        return json.loads(content), data["sha"]
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return {}, None
+        raise
+
+def write_state(filename, state, sha, message):
+    content = json.dumps(
+        state,
+        ensure_ascii=False,
+        indent=2
+    )
+
+    payload = {
+        "message": message,
+        "content": base64.b64encode(
+            content.encode()
+        ).decode(),
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    github_request(filename, payload)
+
+def should_run():
+    now = datetime.now(LOCAL_TZ)
+
+    if not (8 <= now.hour < 23):
+        print("Hozir belgilangan ish vaqti emas.")
+        return False
+
+    state, sha = read_state("schedule_state.json")
+
+    last_run_text = state.get("last_run")
+
+    if last_run_text:
+        last_run = datetime.fromisoformat(last_run_text)
+
+        if now - last_run < timedelta(minutes=25):
+            print("25 daqiqa hali o'tmadi. Keyingi tekshiruv kutiladi.")
+            return False
+
+    state["last_run"] = now.isoformat()
+
+    write_state(
+        "schedule_state.json",
+        state,
+        sha,
+        "Update ON24 schedule"
+    )
+
+    print("Yangiliklarni tekshirish boshlandi.")
+    return True
+
 def clean(text):
     text = re.sub(r"<[^>]+>", " ", text or "")
-    return html.unescape(re.sub(r"\s+", " ", text)).strip()
+    return html.unescape(
+        re.sub(r"\s+", " ", text)
+    ).strip()
 
 def get_value(element, name):
     for child in element:
@@ -60,14 +146,31 @@ def get_value(element, name):
             return child.text or child.attrib.get("href", "")
     return ""
 
+def get_link(entry):
+    link = get_value(entry, "link")
+
+    if link.startswith("http"):
+        return link
+
+    for child in entry:
+        if child.tag.split("}")[-1].lower() == "link":
+            href = child.attrib.get("href", "")
+            if href.startswith("http"):
+                return href
+
+    return ""
+
 def parse_date(value):
     if not value:
         return None
+
     try:
         date = parsedate_to_datetime(value)
     except Exception:
         try:
-            date = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            date = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
         except Exception:
             return None
 
@@ -84,101 +187,7 @@ def score_news(title, summary):
         if word in text:
             score += 3
 
-    if any(word in text for word in [
-        "rasmiy", "official", "официально",
-        "vazir", "prezident", "hokim",
-        "minister", "министр"
-    ]):
-        score += 1
-
     return score
-
-def get_link(entry):
-    link = get_value(entry, "link")
-
-    if link.startswith("http"):
-        return link
-
-    for child in entry:
-        if child.tag.split("}")[-1].lower() == "link":
-            href = child.attrib.get("href", "")
-            if href.startswith("http"):
-                return href
-
-    return ""
-
-def load_sent_items():
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        print("GitHub xotirasi ulanmagan.")
-        return set(), None
-
-    url = (
-        f"https://api.github.com/repos/"
-        f"{GITHUB_REPOSITORY}/contents/{STATE_FILE}"
-    )
-
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "ON24-News-Monitor"
-        }
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            data = json.loads(response.read().decode())
-
-        content = base64.b64decode(data["content"]).decode()
-        items = json.loads(content)
-        return set(items), data["sha"]
-
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return set(), None
-        raise
-
-def save_sent_items(items, sha):
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        print("Takrorlarni doimiy saqlash uchun GITHUB_TOKEN kerak.")
-        return
-
-    url = (
-        f"https://api.github.com/repos/"
-        f"{GITHUB_REPOSITORY}/contents/{STATE_FILE}"
-    )
-
-    content = json.dumps(
-        sorted(items)[-1000:],
-        ensure_ascii=False,
-        indent=2
-    )
-
-    payload = {
-        "message": "Update sent news history",
-        "content": base64.b64encode(
-            content.encode()
-        ).decode()
-    }
-
-    if sha:
-        payload["sha"] = sha
-
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "ON24-News-Monitor",
-            "Content-Type": "application/json"
-        },
-        method="PUT"
-    )
-
-    with urllib.request.urlopen(request, timeout=20) as response:
-        print("Yuborilgan xabarlar tarixi saqlandi.")
 
 def send(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -186,7 +195,7 @@ def send(text):
     data = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": text,
-        "disable_web_page_preview": "false"
+        "disable_web_page_preview": "false",
     }).encode()
 
     request = urllib.request.Request(url, data=data)
@@ -195,10 +204,15 @@ def send(text):
         print(response.read().decode())
 
 def main():
+    if not should_run():
+        return
+
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=35)
 
-    sent_items, state_sha = load_sent_items()
+    sent_state, sent_sha = read_state("sent_items.json")
+    sent_items = set(sent_state.get("items", []))
+
     news = []
 
     for source, feed_url in FEEDS.items():
@@ -224,7 +238,6 @@ def main():
                 summary = clean(
                     get_value(entry, "description")
                     or get_value(entry, "summary")
-                    or get_value(entry, "encoded")
                 )
 
                 date_text = (
@@ -246,8 +259,6 @@ def main():
                 if item_id in sent_items:
                     continue
 
-                score = score_news(title, summary)
-
                 news.append({
                     "date": published,
                     "source": source,
@@ -255,7 +266,7 @@ def main():
                     "summary": summary,
                     "link": link,
                     "id": item_id,
-                    "score": score
+                    "score": score_news(title, summary),
                 })
 
             print(f"{source}: tekshirildi")
@@ -271,8 +282,6 @@ def main():
     if not news:
         print("Yangi xabar topilmadi.")
         return
-
-    sent_count = 0
 
     for item in news[:10]:
         local_time = item["date"].astimezone(
@@ -292,14 +301,15 @@ def main():
 
         send(message)
         sent_items.add(item["id"])
-        sent_count += 1
 
-    save_sent_items(sent_items, state_sha)
+    write_state(
+        "sent_items.json",
+        {"items": sorted(sent_items)[-1000:]},
+        sent_sha,
+        "Update sent news history"
+    )
 
-    print(f"Yuborilgan xabarlar: {sent_count}")
-
-if __name__ == "__main__":
-    main()
+    print(f"Yuborilgan xabarlar: {min(len(news), 10)}")
 
 if __name__ == "__main__":
     main()
