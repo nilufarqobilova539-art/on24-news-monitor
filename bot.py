@@ -1,7 +1,7 @@
 import os
 import urllib.parse
 import urllib.request
-import json
+import urllib.error
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
@@ -15,6 +15,9 @@ data = urllib.parse.urlencode({
 
 request = urllib.request.Request(url, data=data)
 
-with urllib.request.urlopen(request) as response:
-    result = json.loads(response.read().decode())
-    print(result)
+try:
+    with urllib.request.urlopen(request) as response:
+        print(response.read().decode())
+except urllib.error.HTTPError as error:
+    print(error.read().decode())
+    raise
